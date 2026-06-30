@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>基金分析工具</title>
+<title>Fund-Tool</title>
 <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
 <style>
 :root {
@@ -143,6 +143,19 @@ body {
 .toast.info { background: var(--accent); }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.refresh-area { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.refresh-btn {
+  padding: 8px 14px; border-radius: 10px; border: 1px solid var(--border);
+  background: transparent; color: var(--text); font-size: 13px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; transition: all 0.2s;
+}
+.refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
+.refresh-btn .icon { font-size: 16px; }
+.refresh-time { font-size: 11px; color: var(--text-secondary); white-space: nowrap; }
+.refresh-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 4px; }
+.refresh-dot.live { background: var(--green); animation: pulse 2s infinite; }
+.refresh-dot.idle { background: var(--text-secondary); }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
 @media (max-width: 768px) {
   .grid-2, .grid-3, .grid-4 { grid-template-columns: 1fr; }
   .search-box input { width: 100%; }
@@ -156,11 +169,17 @@ body {
 <div class="container">
   <div class="header">
     <h1>📈 基金分析工具</h1>
-    <div class="search-box">
-      <input type="text" id="searchInput" placeholder="搜索基金代码或名称，回车添加"
-             oninput="handleSearch()" onkeydown="if(event.key==='Enter')addFund()">
-      <button onclick="addFund()">➕ 添加</button>
-      <div class="search-results" id="searchResults"></div>
+    <div class="refresh-area">
+      <div class="refresh-time" id="refreshTime"></div>
+      <button class="refresh-btn" onclick="quickRefreshEstimate()" id="refreshBtn" title="刷新估算数据">
+        <span class="icon">🔄</span> 刷新
+      </button>
+      <div class="search-box">
+        <input type="text" id="searchInput" placeholder="搜索基金代码或名称，回车添加"
+               oninput="handleSearch()" onkeydown="if(event.key==='Enter')addFund()">
+        <button onclick="addFund()">➕ 添加</button>
+        <div class="search-results" id="searchResults"></div>
+      </div>
     </div>
   </div>
 
@@ -200,6 +219,34 @@ let searchTimer = null;
 let searchResultsData = [];
 let fundCache = {};  // 缓存已加载的基金数据
 let chartInstances = {};  // 图表实例管理
+let currentAnalyzedCode = null;  // 当前正在分析的基金代码
+let lastRefreshTime = null;  // 上次刷新时间
+let autoRefreshTimer = null;  // 自动刷新定时器
+
+// ==================== 交易时间判断 ====================
+function isTradingTime() {
+  const now = new Date();
+  const day = now.getDay();
+  if (day === 0 || day === 6) return false; // 周末
+  const h = now.getHours(), m = now.getMinutes();
+  const minutes = h * 60 + m;
+  return minutes >= 570 && minutes <= 900; // 9:30 - 15:00
+}
+
+function getNextTradingInfo() {
+  const now = new Date();
+  const day = now.getDay();
+  const h = now.getHours(), m = now.getMinutes();
+  const mins = h * 60 + m;
+  if (day >= 1 && day <= 5 && mins < 570) {
+    const left = 570 - mins;
+    return { label: `距开盘 ${Math.floor(left/60)}时${left%60}分`, live: false };
+  }
+  if (day >= 1 && day <= 5 && mins <= 900) {
+    return { label: '交易中', live: true };
+  }
+  return { label: '已收盘', live: false };
+}
 
 // ==================== Toast ====================
 function toast(msg, type='info') {
@@ -620,10 +667,17 @@ async function analyzeFund(code) {
   const chip = document.getElementById('chip-' + code);
   if (chip) chip.classList.add('active');
   
-  // 切换到仪表盘标签页，但不触发 switchTab 里的 analyzeFund
-  currentTab = 'dashboard';
+  // 记录当前基金，启动自动刷新
+  currentAnalyzedCode = code;
+  lastRefreshTime = Date.now();
+  updateRefreshTimeDisplay();
+  
+  // 如果当前在单基金页签，停留在当前页签；否则默认仪表盘
+  const singleFundTabs = ['dashboard', 'returns', 'risk', 'dca'];
+  if (!singleFundTabs.includes(currentTab)) currentTab = 'dashboard';
+  const stayTab = currentTab;
   document.querySelectorAll('.tab').forEach(el => el.classList.remove('active'));
-  const tabEl = document.getElementById('tab-dashboard');
+  const tabEl = document.getElementById('tab-' + stayTab);
   if (tabEl) tabEl.classList.add('active');
   
   const content = document.getElementById('content');
@@ -636,10 +690,19 @@ async function analyzeFund(code) {
       content.innerHTML = '<div class="card"><p style="color:var(--red);">该基金暂无足够历史数据</p></div>';
       return;
     }
-    const returns = calcReturns(data.nav_data);
-    const risk = calcRisk(data.nav_data);
-    const score = calcScore(data.info, data.nav_data);
-    renderDashboard({ ...data, returns, risk, score });
+    // 根据停留的页签渲染对应内容
+    if (stayTab === 'dashboard') {
+      const returns = calcReturns(data.nav_data);
+      const risk = calcRisk(data.nav_data);
+      const score = calcScore(data.info, data.nav_data);
+      renderDashboard({ ...data, returns, risk, score });
+    } else if (stayTab === 'returns') {
+      renderReturnsContent(data);
+    } else if (stayTab === 'risk') {
+      renderRiskContent(data);
+    } else if (stayTab === 'dca') {
+      renderDCATab(code);
+    }
   } catch(e) {
     content.innerHTML = '<div class="card"><p style="color:var(--red);">分析失败，请检查网络连接后重试</p></div>';
     console.error(e);
@@ -662,9 +725,9 @@ function renderDashboard(data) {
         <div>
           <h2 style="font-size:22px;">${info.name}</h2>
           <p style="color:var(--text-secondary);font-size:13px;">
-            代码：${info.code} | 类型：${info.type || '--'} | 最新净值：${info.nav || '--'}
-            ${info.estimate_change !== null && info.estimate_change !== undefined ? 
-              `<span style="color:${info.estimate_change>=0?'var(--green)':'var(--red)'}"> | 估算：${info.estimate_change>=0?'+':''}${info.estimate_change}%</span>` : ''}
+            代码：${info.code} | 类型：${info.type || '--'} | 最新净值：<span id="currentNav">${info.nav || '--'}</span>
+            <span id="estimateInfo">${info.estimate_change !== null && info.estimate_change !== undefined ? 
+              `<span style="color:${info.estimate_change>=0?'var(--green)':'var(--red)'}"> | 估算：${info.estimate_change>=0?'+':''}${info.estimate_change}%</span>` : ''}</span>
           </p>
         </div>
         <div class="score-card" style="min-width:160px;padding:24px;margin:0;">
@@ -724,101 +787,188 @@ async function switchTab(tab) {
     return;
   }
   const code = myFunds[0].code;
-  if (tab === 'dashboard') analyzeFund(code);
-  else if (tab === 'returns') renderReturnsTab(code);
-  else if (tab === 'risk') renderRiskTab(code);
+  if (tab === 'dashboard') {
+    const dashCode = (currentAnalyzedCode && myFunds.find(f => f.code === currentAnalyzedCode))
+      ? currentAnalyzedCode : code;
+    analyzeFund(dashCode);
+    quickRefreshEstimate();
+  }
+  else if (tab === 'returns') {
+    const retCode = (currentAnalyzedCode && myFunds.find(f => f.code === currentAnalyzedCode))
+      ? currentAnalyzedCode : code;
+    renderReturnsTab(retCode);
+  }
+  else if (tab === 'risk') {
+    const riskCode = (currentAnalyzedCode && myFunds.find(f => f.code === currentAnalyzedCode))
+      ? currentAnalyzedCode : code;
+    renderRiskTab(riskCode);
+  }
   else if (tab === 'compare') renderCompareTab();
-  else if (tab === 'dca') renderDCATab(code);
+  else if (tab === 'dca') {
+    // 使用当前选中的基金，而非基金池第一支
+    const dcaCode = (currentAnalyzedCode && myFunds.find(f => f.code === currentAnalyzedCode))
+      ? currentAnalyzedCode : code;
+    renderDCATab(dcaCode);
+  }
+}
+
+// ==================== 快速刷新估算（不改全套分析） ====================
+async function quickRefreshEstimate() {
+  if (!currentAnalyzedCode || currentTab !== 'dashboard') return;
+  const btn = document.getElementById('refreshBtn');
+  if (btn) { btn.style.opacity = '0.5'; btn.style.pointerEvents = 'none'; }
+  
+  try {
+    const info = await loadFundInfo(currentAnalyzedCode);
+    // 更新缓存中的信息
+    const cacheKey = currentAnalyzedCode + '_full';
+    if (fundCache[cacheKey]) {
+      fundCache[cacheKey].info = { ...fundCache[cacheKey].info, ...info, type: guessType(currentAnalyzedCode) };
+      fundCache[cacheKey]._ts = Date.now();
+    }
+    // 原地更新 DOM（不重新渲染整个仪表盘）
+    const estimateEl = document.getElementById('estimateInfo');
+    if (estimateEl && info.estimate_change !== null && info.estimate_change !== undefined) {
+      const color = info.estimate_change >= 0 ? 'var(--green)' : 'var(--red)';
+      const sign = info.estimate_change >= 0 ? '+' : '';
+      estimateEl.innerHTML = `<span style="color:${color}">估算：${sign}${info.estimate_change}%</span>`;
+    }
+    if (info.nav) {
+      const navEl = document.getElementById('currentNav');
+      if (navEl) navEl.textContent = info.nav;
+    }
+    lastRefreshTime = Date.now();
+    updateRefreshTimeDisplay();
+  } catch(e) {
+    console.log('快速刷新失败', e);
+  }
+  if (btn) { btn.style.opacity = '1'; btn.style.pointerEvents = 'auto'; }
+}
+
+function updateRefreshTimeDisplay() {
+  const el = document.getElementById('refreshTime');
+  if (!el) return;
+  if (!lastRefreshTime) { el.innerHTML = ''; return; }
+  const secs = Math.floor((Date.now() - lastRefreshTime) / 1000);
+  const tInfo = getNextTradingInfo();
+  const dotClass = tInfo.live ? 'live' : 'idle';
+  const text = secs < 60 ? `刚刚更新` : secs < 3600 ? `${Math.floor(secs/60)}分钟前` : `${Math.floor(secs/3600)}小时前`;
+  el.innerHTML = `<span class="refresh-dot ${dotClass}"></span>${text} · ${tInfo.label}`;
+}
+
+function startAutoRefresh() {
+  stopAutoRefresh();
+  // 每30秒刷新估算
+  autoRefreshTimer = setInterval(() => {
+    if (isTradingTime() && currentTab === 'dashboard' && currentAnalyzedCode) {
+      quickRefreshEstimate();
+    }
+    updateRefreshTimeDisplay();
+  }, 30000);
+  // 也每5秒更新一次时间显示
+  setInterval(updateRefreshTimeDisplay, 5000);
+}
+
+function stopAutoRefresh() {
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
 }
 
 async function renderReturnsTab(code) {
   document.getElementById('content').innerHTML = '<div style="text-align:center;padding:60px;">⏳ 加载中...</div>';
   try {
     const data = await loadFundData(code);
-    const returns = calcReturns(data.nav_data);
-    const navData = data.nav_data;
-    let cumReturns = [0], cumLabels = [navData[0]?.date||''];
-    if (navData.length > 1) {
-      const base = navData[0].nav;
-      for (let i = 1; i < navData.length; i++) {
-        cumReturns.push(Math.round((navData[i].nav / base - 1) * 1e4) / 100);
-        cumLabels.push(navData[i].date);
-      }
-    }
-    const r = returns;
-    document.getElementById('content').innerHTML = `
-      <div class="card">
-        <h3>📈 ${data.info.name} - 收益分析</h3>
-        <div class="grid-4" style="margin-bottom:16px;">
-          <div class="stat-card"><div class="label">近1周</div><div class="value" style="color:${(r.return_1w||0)>=0?'var(--green)':'var(--red)'}">${r.return_1w!==null?(r.return_1w>=0?'+':'')+r.return_1w+'%':'--'}</div></div>
-          <div class="stat-card"><div class="label">近1月</div><div class="value" style="color:${(r.return_1m||0)>=0?'var(--green)':'var(--red)'}">${r.return_1m!==null?(r.return_1m>=0?'+':'')+r.return_1m+'%':'--'}</div></div>
-          <div class="stat-card"><div class="label">近3月</div><div class="value" style="color:${(r.return_3m||0)>=0?'var(--green)':'var(--red)'}">${r.return_3m!==null?(r.return_3m>=0?'+':'')+r.return_3m+'%':'--'}</div></div>
-          <div class="stat-card"><div class="label">近1年</div><div class="value" style="color:${(r.return_1y||0)>=0?'var(--green)':'var(--red)'}">${r.return_1y!==null?(r.return_1y>=0?'+':'')+r.return_1y+'%':'--'}</div></div>
-        </div>
-        <div class="chart-container" id="cumReturnChart"></div>
-        <div class="tip">💡 <strong>怎么看：</strong>曲线从0开始，向上=赚钱，向下=亏损。年化收益率${r.annualized!==null?(r.annualized>=0?'+':'')+r.annualized+'%':'--'}。</div>
-      </div>`;
-    setTimeout(() => {
-      const chart = safeInitChart('cumReturnChart', 'cumReturnChart');
-      if (!chart) return;
-      chart.setOption({
-        tooltip:{trigger:'axis',backgroundColor:'#1e293b',borderColor:'#334155',textStyle:{color:'#e2e8f0'}},
-        grid:{left:'3%',right:'5%',top:10,bottom:30},
-        xAxis:{type:'category',data:cumLabels,axisLabel:{color:'#94a3b8',fontSize:10,formatter:v=>v.slice(5)},splitLine:{show:false}},
-        yAxis:{type:'value',axisLabel:{color:'#94a3b8',formatter:'{value}%'},splitLine:{lineStyle:{color:'#1e293b'}}},
-        series:[{type:'line',data:cumReturns,smooth:true,showSymbol:false,
-          lineStyle:{color:'#8b5cf6',width:2},
-          areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[
-            {offset:0,color:'rgba(139,92,246,0.3)'},{offset:1,color:'rgba(139,92,246,0.02)'}])},
-          markLine:{silent:true,data:[{yAxis:0,lineStyle:{color:'#ef4444',type:'dashed'}}]}
-        }]
-      });
-    }, 150);
+    renderReturnsContent(data);
   } catch(e) { console.error(e); }
+}
+
+function renderReturnsContent(data) {
+  const returns = calcReturns(data.nav_data);
+  const navData = data.nav_data;
+  let cumReturns = [0], cumLabels = [navData[0]?.date||''];
+  if (navData.length > 1) {
+    const base = navData[0].nav;
+    for (let i = 1; i < navData.length; i++) {
+      cumReturns.push(Math.round((navData[i].nav / base - 1) * 1e4) / 100);
+      cumLabels.push(navData[i].date);
+    }
+  }
+  const r = returns;
+  document.getElementById('content').innerHTML = `
+    <div class="card">
+      <h3>📈 ${data.info.name} - 收益分析</h3>
+      <div class="grid-4" style="margin-bottom:16px;">
+        <div class="stat-card"><div class="label">近1周</div><div class="value" style="color:${(r.return_1w||0)>=0?'var(--green)':'var(--red)'}">${r.return_1w!==null?(r.return_1w>=0?'+':'')+r.return_1w+'%':'--'}</div></div>
+        <div class="stat-card"><div class="label">近1月</div><div class="value" style="color:${(r.return_1m||0)>=0?'var(--green)':'var(--red)'}">${r.return_1m!==null?(r.return_1m>=0?'+':'')+r.return_1m+'%':'--'}</div></div>
+        <div class="stat-card"><div class="label">近3月</div><div class="value" style="color:${(r.return_3m||0)>=0?'var(--green)':'var(--red)'}">${r.return_3m!==null?(r.return_3m>=0?'+':'')+r.return_3m+'%':'--'}</div></div>
+        <div class="stat-card"><div class="label">近1年</div><div class="value" style="color:${(r.return_1y||0)>=0?'var(--green)':'var(--red)'}">${r.return_1y!==null?(r.return_1y>=0?'+':'')+r.return_1y+'%':'--'}</div></div>
+      </div>
+      <div class="chart-container" id="cumReturnChart"></div>
+      <div class="tip">💡 <strong>怎么看：</strong>曲线从0开始，向上=赚钱，向下=亏损。年化收益率${r.annualized!==null?(r.annualized>=0?'+':'')+r.annualized+'%':'--'}。</div>
+    </div>`;
+  setTimeout(() => {
+    const chart = safeInitChart('cumReturnChart', 'cumReturnChart');
+    if (!chart) return;
+    chart.setOption({
+      tooltip:{trigger:'axis',backgroundColor:'#1e293b',borderColor:'#334155',textStyle:{color:'#e2e8f0'}},
+      grid:{left:'3%',right:'5%',top:10,bottom:30},
+      xAxis:{type:'category',data:cumLabels,axisLabel:{color:'#94a3b8',fontSize:10,formatter:v=>v.slice(5)},splitLine:{show:false}},
+      yAxis:{type:'value',axisLabel:{color:'#94a3b8',formatter:'{value}%'},splitLine:{lineStyle:{color:'#1e293b'}}},
+      series:[{type:'line',data:cumReturns,smooth:true,showSymbol:false,
+        lineStyle:{color:'#8b5cf6',width:2},
+        areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[
+          {offset:0,color:'rgba(139,92,246,0.3)'},{offset:1,color:'rgba(139,92,246,0.02)'}])},
+        markLine:{silent:true,data:[{yAxis:0,lineStyle:{color:'#ef4444',type:'dashed'}}]}
+      }]
+    });
+  }, 150);
 }
 
 async function renderRiskTab(code) {
   document.getElementById('content').innerHTML = '<div style="text-align:center;padding:60px;">⏳ 加载中...</div>';
   try {
     const data = await loadFundData(code);
-    const risk = calcRisk(data.nav_data);
-    const navData = data.nav_data;
-    let drawdowns = [], ddLabels = [], peak = 0;
-    for (const d of navData) {
-      if (d.nav > peak) peak = d.nav;
-      drawdowns.push(Math.round((peak>0?(peak-d.nav)/peak*100:0)*100)/100);
-      ddLabels.push(d.date);
-    }
-    document.getElementById('content').innerHTML = `
-      <div class="card">
-        <h3>⚠ ${data.info.name} - 风险评估</h3>
-        <div class="grid-3" style="margin-bottom:16px;">
-          <div class="stat-card"><div class="label">年化波动率</div><div class="value" style="color:var(--orange);">${risk.volatility||'--'}%</div></div>
-          <div class="stat-card"><div class="label">最大回撤</div><div class="value" style="color:var(--red);">-${risk.max_drawdown||'--'}%</div></div>
-          <div class="stat-card"><div class="label">夏普比率</div><div class="value" style="color:${(risk.sharpe_ratio||0)>=1?'var(--green)':'var(--orange)'}">${risk.sharpe_ratio||'--'}</div></div>
-        </div>
-        <div class="chart-container" id="ddChart"></div>
-        <div class="tip" style="margin-top:16px;">
-          💡 <strong>解读：</strong>波动率${risk.volatility||'--'}%表示抖动幅度，回撤-${risk.max_drawdown||'--'}%是历史最惨跌幅。
-          夏普比率${risk.sharpe_ratio||'--'}（>1不错，>2优秀）。胜率${risk.win_rate||'--'}%。
-        </div>
-      </div>`;
-    setTimeout(() => {
-      const chart = safeInitChart('ddChart', 'ddChart');
-      if (!chart) return;
-      chart.setOption({
-        tooltip:{trigger:'axis',backgroundColor:'#1e293b',borderColor:'#334155',textStyle:{color:'#e2e8f0'},formatter:p=>`${p[0].axisValue}<br/>回撤: -${Math.abs(p[0].value)}%`},
-        grid:{left:'3%',right:'5%',top:10,bottom:30},
-        xAxis:{type:'category',data:ddLabels,axisLabel:{color:'#94a3b8',fontSize:10,formatter:v=>v.slice(5)},splitLine:{show:false}},
-        yAxis:{type:'value',inverse:true,axisLabel:{color:'#94a3b8',formatter:'-{value}%'},splitLine:{lineStyle:{color:'#1e293b'}}},
-        series:[{type:'line',data:drawdowns,smooth:true,showSymbol:false,
-          lineStyle:{color:'#ef4444',width:2},
-          areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[
-            {offset:0,color:'rgba(239,68,68,0.4)'},{offset:1,color:'rgba(239,68,68,0.02)'}])}
-        }]
-      });
-    }, 150);
+    renderRiskContent(data);
   } catch(e) { console.error(e); }
+}
+
+function renderRiskContent(data) {
+  const risk = calcRisk(data.nav_data);
+  const navData = data.nav_data;
+  let drawdowns = [], ddLabels = [], peak = 0;
+  for (const d of navData) {
+    if (d.nav > peak) peak = d.nav;
+    drawdowns.push(Math.round((peak>0?(peak-d.nav)/peak*100:0)*100)/100);
+    ddLabels.push(d.date);
+  }
+  document.getElementById('content').innerHTML = `
+    <div class="card">
+      <h3>⚠ ${data.info.name} - 风险评估</h3>
+      <div class="grid-3" style="margin-bottom:16px;">
+        <div class="stat-card"><div class="label">年化波动率</div><div class="value" style="color:var(--orange);">${risk.volatility||'--'}%</div></div>
+        <div class="stat-card"><div class="label">最大回撤</div><div class="value" style="color:var(--red);">-${risk.max_drawdown||'--'}%</div></div>
+        <div class="stat-card"><div class="label">夏普比率</div><div class="value" style="color:${(risk.sharpe_ratio||0)>=1?'var(--green)':'var(--orange)'}">${risk.sharpe_ratio||'--'}</div></div>
+      </div>
+      <div class="chart-container" id="ddChart"></div>
+      <div class="tip" style="margin-top:16px;">
+        💡 <strong>解读：</strong>波动率${risk.volatility||'--'}%表示抖动幅度，回撤-${risk.max_drawdown||'--'}%是历史最惨跌幅。
+        夏普比率${risk.sharpe_ratio||'--'}（>1不错，>2优秀）。胜率${risk.win_rate||'--'}%。
+      </div>
+    </div>`;
+  setTimeout(() => {
+    const chart = safeInitChart('ddChart', 'ddChart');
+    if (!chart) return;
+    chart.setOption({
+      tooltip:{trigger:'axis',backgroundColor:'#1e293b',borderColor:'#334155',textStyle:{color:'#e2e8f0'},formatter:p=>`${p[0].axisValue}<br/>回撤: -${Math.abs(p[0].value)}%`},
+      grid:{left:'3%',right:'5%',top:10,bottom:30},
+      xAxis:{type:'category',data:ddLabels,axisLabel:{color:'#94a3b8',fontSize:10,formatter:v=>v.slice(5)},splitLine:{show:false}},
+      yAxis:{type:'value',inverse:true,axisLabel:{color:'#94a3b8',formatter:'-{value}%'},splitLine:{lineStyle:{color:'#1e293b'}}},
+      series:[{type:'line',data:drawdowns,smooth:true,showSymbol:false,
+        lineStyle:{color:'#ef4444',width:2},
+        areaStyle:{color:new echarts.graphic.LinearGradient(0,0,0,1,[
+          {offset:0,color:'rgba(239,68,68,0.4)'},{offset:1,color:'rgba(239,68,68,0.02)'}])}
+      }]
+    });
+  }, 150);
 }
 
 async function renderCompareTab() {
@@ -970,6 +1120,7 @@ async function runDCA(code) {
 document.addEventListener('DOMContentLoaded', () => {
   renderFundList();
   if (myFunds.length > 0) analyzeFund(myFunds[0].code);
+  startAutoRefresh();
 });
 
 document.addEventListener('click', e => {
